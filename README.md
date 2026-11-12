@@ -20,6 +20,10 @@ Open in two browsers/devices, create a profile in each, then exchange the invite
 - **Resilience**: any subset of the configured relays works; passphrase-encrypted backup export covers keys + history.
 - **Nerd mode** (settings toggle) exposes fingerprints, pubkeys, relay config, connection info, and the manual invite flow.
 
+## Hosting
+
+The repo is the primary entrypoint: clone it, `npm ci`, `npm run build`, and serve `dist/` from any static host (or just `npm run dev`). `npm run build:pages` builds with base path `/uchat5/` for the GitHub Pages demo mirror on the `gh-pages` branch (https://airbusa380airplane.github.io/uchat5/). Pages is only a convenience mirror — the same `dist/` can be hosted anywhere.
+
 ## Use within network policy
 
 This is an ordinary web app. It does not attempt to evade network filtering or monitoring, and should only be used where permitted.
