@@ -9,6 +9,7 @@
     "noFallthroughCasesInSwitch": true,
     "skipLibCheck": true,
     "noEmit": true,
+    "allowImportingTsExtensions": true,
     "isolatedModules": true,
     "useDefineForClassFields": true,
     "types": ["vite/client", "node"]

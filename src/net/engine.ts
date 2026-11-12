@@ -11,7 +11,7 @@ import {
   type SignedIdentity,
 } from '../crypto/keys'
 import { decodeInvite, encodeInvite, newRoomSecret, type InvitePayload } from '../crypto/invite'
-import { makeSession, type SessionCrypto } from '../crypto/session'
+import { initRatchet, ratchetDecrypt, ratchetEncrypt, type RatchetState } from '../crypto/ratchet'
 import { PeerLink, waitGather } from './webrtc'
 import type { WireMessage } from './protocol'
 
@@ -19,7 +19,7 @@ const ICE: RTCIceServer[] = [{ urls: ['stun:stun.l.google.com:19302', 'stun:glob
 
 interface Conn {
   link: PeerLink
-  session: SessionCrypto | null
+  ratchet: RatchetState | null
   their: SignedIdentity | null
   room: string
 }
@@ -95,7 +95,7 @@ class Engine {
     const entry = this.rooms.get(roomId)
     if (!entry || this.conns.has(peerId)) return
     const link = new PeerLink(ICE)
-    const conn: Conn = { link, session: null, their: null, room: roomId }
+    const conn: Conn = { link, ratchet: null, their: null, room: roomId }
     this.conns.set(peerId, conn)
     this.wire(peerId, conn)
     const desc = await link.offer()
@@ -108,7 +108,7 @@ class Engine {
     if (data?.kind === 'offer') {
       if (from > this.selfId || this.conns.has(from)) return
       const link = new PeerLink(ICE)
-      const conn: Conn = { link, session: null, their: null, room: roomId }
+      const conn: Conn = { link, ratchet: null, their: null, room: roomId }
       this.conns.set(from, conn)
       this.wire(from, conn)
       link.answer(data.desc).then(desc => entry.send({ kind: 'answer', desc }, from))
@@ -144,26 +144,31 @@ class Engine {
       if (!ok) return
       conn.their = m.id
       this.byEd.set(m.id.record.edPub, peerId)
+      const me = getState().identity!
       const { x } = await this.myKeys()
-      const shared = await deriveShared(x, m.xPub)
-      conn.session = await makeSession(shared)
+      const shared = new Uint8Array(await deriveShared(x, m.xPub))
+      const initiator = me.record.edPub < m.id.record.edPub
+      conn.ratchet = await initRatchet(shared, x, unb64u(me.record.xPub), unb64u(m.xPub), initiator)
       actions.upsertPeer(m.id.record.edPub, { id: m.id, status: 'online', lastSeen: Date.now() })
       conn.link.send({ v: 1, t: 'peers', ids: this.knownIds() })
+      if (initiator) {
+        const { h, ct } = await ratchetEncrypt(conn.ratchet, new Uint8Array(0))
+        conn.link.send({ v: 2, t: 'msg', h, ct, ts: Date.now() })
+      }
       void this.flush(peerId, conn)
-    } else if (m.t === 'msg' && conn.session && conn.their) {
-      try {
-        const pt = await conn.session.decrypt(m.ct)
-        const text = new TextDecoder().decode(pt)
+    } else if (m.t === 'msg' && conn.ratchet && conn.their) {
+      const pt = await ratchetDecrypt(conn.ratchet, m.h, m.ct)
+      if (!pt) return
+      if (pt.length > 0) {
         actions.addMessage(conn.their.record.edPub, {
           id: b64u(crypto.getRandomValues(new Uint8Array(8))),
           from: 'them',
-          text,
+          text: new TextDecoder().decode(pt),
           ts: m.ts,
           status: 'sent',
         })
-      } catch {
-        // undecryptable frame, ignore
       }
+      void this.flush(peerId, conn)
     } else if (m.t === 'peers') {
       for (const id of m.ids) {
         if (id.record.edPub === getState().identity?.record.edPub) continue
@@ -181,12 +186,12 @@ class Engine {
   }
 
   private async flush(peerId: string, conn: Conn): Promise<void> {
-    if (!conn.session || !conn.their) return
+    if (!conn.ratchet?.cks || !conn.their) return
     const edPub = conn.their.record.edPub
     const queued = (getState().messages[edPub] ?? []).filter(m => m.from === 'me' && m.status === 'queued')
     for (const m of queued) {
-      const ct = await conn.session.encrypt(new TextEncoder().encode(m.text))
-      conn.link.send({ v: 1, t: 'msg', ct, ts: m.ts })
+      const { h, ct } = await ratchetEncrypt(conn.ratchet, new TextEncoder().encode(m.text))
+      conn.link.send({ v: 2, t: 'msg', h, ct, ts: m.ts })
       actions.updateMessage(edPub, m.id, { status: 'sent' })
     }
   }
@@ -196,9 +201,9 @@ class Engine {
     const id = b64u(crypto.getRandomValues(new Uint8Array(8)))
     const peerId = this.byEd.get(edPub)
     const conn = peerId ? this.conns.get(peerId) : undefined
-    if (conn?.session && conn.link.open) {
-      const ct = await conn.session.encrypt(new TextEncoder().encode(text))
-      conn.link.send({ v: 1, t: 'msg', ct, ts })
+    if (conn?.ratchet?.cks && conn.link.open) {
+      const { h, ct } = await ratchetEncrypt(conn.ratchet, new TextEncoder().encode(text))
+      conn.link.send({ v: 2, t: 'msg', h, ct, ts })
       actions.addMessage(edPub, { id, from: 'me', text, ts, status: 'sent' })
     } else {
       actions.addMessage(edPub, { id, from: 'me', text, ts, status: 'queued' })
@@ -218,7 +223,7 @@ class Engine {
 
   async manualOffer(): Promise<string> {
     this.manual = new PeerLink(ICE)
-    const conn: Conn = { link: this.manual, session: null, their: null, room: 'manual' }
+    const conn: Conn = { link: this.manual, ratchet: null, their: null, room: 'manual' }
     this.wire('manual', conn)
     const desc = await this.manual.offer()
     const ice = await waitGather(this.manual.pc)
@@ -238,7 +243,7 @@ class Engine {
     const data = JSON.parse(new TextDecoder().decode(unb64u(blob)))
     if (!this.manual) {
       this.manual = new PeerLink(ICE)
-      const conn: Conn = { link: this.manual, session: null, their: null, room: 'manual' }
+      const conn: Conn = { link: this.manual, ratchet: null, their: null, room: 'manual' }
       this.wire('manual', conn)
     }
     await this.manual.accept(data.desc)
