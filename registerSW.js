@@ -1,0 +1,1 @@
+if('serviceWorker' in navigator) {window.addEventListener('load', () => {navigator.serviceWorker.register('/uchat5/sw.js', { scope: '/uchat5/' })})}
